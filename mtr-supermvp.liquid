@@ -1,0 +1,397 @@
+{%- comment -%}
+SuperMVP Pixel (Shopify Theme Snippet)
+
+Events:
+- product_view (product pages)
+- add_to_cart (add-to-cart submit/click)
+
+Identity:
+- Always sets session id cookie swap_sid (30 min rolling)
+- Only sets persistent user id cookie swap_uid if Shopify analytics processing is allowed
+- Adds privacy.consent_state ("granted" | "denied" | "unknown")
+
+Checkout stitching:
+- Stamps cart attributes via /cart/update.js:
+  - attributes.swap_sid = session id
+  - attributes.swap_uid = user id (only if present)
+- Called on add_to_cart and on checkout clicks (links/buttons)
+
+Debug: Set window.SWAP_PIXEL_DEBUG = true or add ?swap_pixel_debug=1 to the URL to log events to console.
+
+Install:
+- Save as snippets/swap_pixel.liquid
+- Include in layout/theme.liquid inside <head> as high as possible:
+  {% render 'swap_pixel' %}
+{%- endcomment -%}
+
+{%- if request.page_type == 'product' -%}
+  {%- assign mtr_product_id = product.id -%}
+  {%- assign mtr_product_handle = product.handle -%}
+{%- endif -%}
+
+{%- assign mtr_page_type_raw = request.page_type -%}
+{%- case request.page_type -%}
+  {%- when 'product' -%}
+    {%- assign mtr_funnel_stage = 'product' -%}
+  {%- when 'collection', 'search' -%}
+    {%- assign mtr_funnel_stage = 'listing' -%}
+  {%- else -%}
+    {%- assign mtr_funnel_stage = 'content' -%}
+{%- endcase -%}
+
+<script>
+(function () {
+  var STORE_ID = "{{ shop.permanent_domain | escape }}";
+  var ENDPOINT = "https://simple-api-y9g7.onrender.com";
+
+  var SID_COOKIE = "swap_sid";
+  var SID_TTL_MIN = 30;
+
+  var UID_COOKIE = "swap_uid";
+  var UID_TTL_DAYS = 395;
+
+  var DEBUG = typeof window !== "undefined" && (
+    window.SWAP_PIXEL_DEBUG === true ||
+    (window.location && window.location.search && window.location.search.indexOf("swap_pixel_debug=1") !== -1)
+  );
+
+  function nowMs() { return Date.now ? Date.now() : (new Date()).getTime(); }
+
+  function uuidv4() {
+    var cryptoObj = window.crypto || window.msCrypto;
+    if (cryptoObj && cryptoObj.getRandomValues) {
+      var buf = new Uint8Array(16);
+      cryptoObj.getRandomValues(buf);
+      buf[6] = (buf[6] & 0x0f) | 0x40;
+      buf[8] = (buf[8] & 0x3f) | 0x80;
+      var bth = [];
+      for (var i = 0; i < 256; i++) bth[i] = (i + 0x100).toString(16).slice(1);
+      return (
+        bth[buf[0]] + bth[buf[1]] + bth[buf[2]] + bth[buf[3]] + "-" +
+        bth[buf[4]] + bth[buf[5]] + "-" +
+        bth[buf[6]] + bth[buf[7]] + "-" +
+        bth[buf[8]] + bth[buf[9]] + "-" +
+        bth[buf[10]] + bth[buf[11]] + bth[buf[12]] + bth[buf[13]] + bth[buf[14]] + bth[buf[15]]
+      );
+    }
+    return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function(c) {
+      var r = Math.random() * 16 | 0;
+      var v = c === "x" ? r : (r & 0x3 | 0x8);
+      return v.toString(16);
+    });
+  }
+
+  function getCookie(name) {
+    var m = document.cookie.match(new RegExp("(^|;\\s*)" + name.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&") + "=([^;]*)"));
+    return m ? decodeURIComponent(m[2]) : null;
+  }
+
+  function setCookieMinutes(name, value, ttlMinutes) {
+    var expires = new Date(nowMs() + ttlMinutes * 60 * 1000).toUTCString();
+    document.cookie =
+      name + "=" + encodeURIComponent(value) +
+      "; Expires=" + expires +
+      "; Path=/" +
+      "; SameSite=Lax" +
+      "; Secure";
+  }
+
+  function setCookieDays(name, value, ttlDays) {
+    var expires = new Date(nowMs() + ttlDays * 24 * 60 * 60 * 1000).toUTCString();
+    document.cookie =
+      name + "=" + encodeURIComponent(value) +
+      "; Expires=" + expires +
+      "; Path=/" +
+      "; SameSite=Lax" +
+      "; Secure";
+  }
+
+  function sendEvent(payload) {
+    if (DEBUG) {
+      try { console.log("[Swap Pixel]", payload.event_name, payload); } catch (e) {}
+    }
+    var body = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      try {
+        var blob = new Blob([body], { type: "application/json" });
+        navigator.sendBeacon(ENDPOINT, blob);
+        return;
+      } catch (e) {}
+    }
+    try {
+      fetch(ENDPOINT, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body,
+        keepalive: true,
+        credentials: "omit"
+      }).catch(function(){});
+    } catch (e) {}
+  }
+
+  // Always ensure session id exists on every page
+  var sid = getCookie(SID_COOKIE);
+  if (!sid) sid = uuidv4();
+  setCookieMinutes(SID_COOKIE, sid, SID_TTL_MIN);
+
+  // Shopify built-in consent handling
+  var consentState = "unknown";
+  var uid = null;
+
+  function computeConsentState() {
+    try {
+      if (window.Shopify &&
+          Shopify.customerPrivacy &&
+          typeof Shopify.customerPrivacy.analyticsProcessingAllowed === "function") {
+        return Shopify.customerPrivacy.analyticsProcessingAllowed() ? "granted" : "denied";
+      }
+    } catch (e) {}
+    return "unknown";
+  }
+
+  function ensureUserIdIfGranted() {
+    if (consentState !== "granted") return;
+    if (uid) return;
+
+    var existing = getCookie(UID_COOKIE);
+    uid = existing || uuidv4();
+    setCookieDays(UID_COOKIE, uid, UID_TTL_DAYS);
+  }
+
+  function attemptLoadCustomerPrivacyApi(cb) {
+    try {
+      if (window.Shopify && typeof Shopify.loadFeatures === "function") {
+        Shopify.loadFeatures([{ name: "consent-tracking-api", version: "0.1" }], function () {
+          cb();
+        });
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  function loadCustomerPrivacyApi(cb) {
+    if (attemptLoadCustomerPrivacyApi(cb)) return;
+
+    var tries = 0;
+    var t = setInterval(function () {
+      tries += 1;
+      if (attemptLoadCustomerPrivacyApi(cb) || tries >= 20) {
+        clearInterval(t);
+        cb();
+      }
+    }, 50);
+  }
+
+  loadCustomerPrivacyApi(function () {
+    consentState = computeConsentState();
+    ensureUserIdIfGranted();
+
+    document.addEventListener("visitorConsentCollected", function () {
+      consentState = computeConsentState();
+      ensureUserIdIfGranted();
+    });
+  });
+
+  function buildBaseEvent(eventName) {
+    var evt = {
+      schema_version: "supermvp-2.0",
+      event_id: uuidv4(),
+      event_name: eventName,
+      store_id: STORE_ID,
+      session_id: sid,
+      user_id: uid || null,
+      occurred_at: (new Date()).toISOString(),
+      page: {
+        url: window.location.href,
+        path: window.location.pathname,
+        title: document.title,
+        referrer: document.referrer || "",
+        page_type_raw: "{{ mtr_page_type_raw | default: '' | escape }}",
+        funnel_stage: "{{ mtr_funnel_stage | default: 'content' | escape }}"
+      },
+      privacy: {
+        consent_state: consentState
+      }
+    };
+    return evt;
+  }
+
+  function isProductPage() {
+    return "{{ request.page_type }}" === "product";
+  }
+
+  function getProductContextFromLiquid() {
+    var product = {};
+    var liquidProductId = {{ mtr_product_id | default: 'null' }};
+    var liquidHandle = "{{ mtr_product_handle | default: '' | escape }}";
+    if (liquidProductId !== null) product.product_id = String(liquidProductId);
+    if (liquidHandle) product.product_handle = liquidHandle;
+    return product;
+  }
+
+  // Checkout stitching: stamp ids into cart attributes
+  // This is the key join mechanism for checkout events on other domains.
+  function stampCartAttributes() {
+    var attrs = { swap_sid: sid };
+    if (uid) attrs.swap_uid = uid;
+
+    try {
+      fetch("/cart/update.js", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify({ attributes: attrs }),
+        credentials: "same-origin",
+        keepalive: true
+      }).catch(function(){});
+    } catch (e) {}
+  }
+
+  // Product view: product pages only
+  if (isProductPage()) {
+    var productForView = getProductContextFromLiquid();
+    var sentProductView = false;
+
+    function sendProductViewOnce() {
+      if (sentProductView) return;
+      sentProductView = true;
+      var evt = buildBaseEvent("product_view");
+      evt.product = productForView;
+      sendEvent(evt);
+    }
+
+    // Give consent API a moment, but do not block
+    setTimeout(sendProductViewOnce, 250);
+    setTimeout(sendProductViewOnce, 500);
+  }
+
+  // Add to cart tracking (submit + click fallback)
+  function findClosest(el, predicate) {
+    while (el && el !== document.documentElement) {
+      if (predicate(el)) return el;
+      el = el.parentNode;
+    }
+    return null;
+  }
+
+  function isAddToCartForm(form) {
+    if (!form || !form.getAttribute) return false;
+    var action = (form.getAttribute("action") || "").toLowerCase();
+    return action.indexOf("/cart/add") !== -1;
+  }
+
+  function extractProductFromAddForm(form) {
+    var product = {};
+
+    try {
+      var idInput = form.querySelector('input[name="id"]');
+      if (idInput && idInput.value) product.variant_id = String(idInput.value);
+    } catch (e) {}
+
+    if (isProductPage()) {
+      var lp = getProductContextFromLiquid();
+      if (lp.product_id) product.product_id = lp.product_id;
+      if (lp.product_handle) product.product_handle = lp.product_handle;
+    } else {
+      try {
+        var pid = form.getAttribute("data-product-id") || form.getAttribute("data-productid");
+        var ph = form.getAttribute("data-product-handle") || form.getAttribute("data-producthandle");
+        if (pid) product.product_id = String(pid);
+        if (ph) product.product_handle = String(ph);
+      } catch (e) {}
+    }
+
+    return product;
+  }
+
+  var lastAddToCartAt = 0;
+  function shouldDebounceAddToCart() {
+    var t = nowMs();
+    if (t - lastAddToCartAt < 500) return true;
+    lastAddToCartAt = t;
+    return false;
+  }
+
+  function fireAddToCart(productCtx) {
+    if (shouldDebounceAddToCart()) return;
+
+    // Stamp ids into cart so checkout pixel can read them later
+    stampCartAttributes();
+
+    var evt = buildBaseEvent("add_to_cart");
+    evt.product = productCtx || {};
+    sendEvent(evt);
+  }
+
+  document.addEventListener("submit", function (e) {
+    try {
+      var form = e.target;
+      if (!isAddToCartForm(form)) return;
+      fireAddToCart(extractProductFromAddForm(form));
+    } catch (err) {}
+  }, true);
+
+  document.addEventListener("click", function (e) {
+    try {
+      var target = e.target;
+
+      var btn = findClosest(target, function (el) {
+        if (!el || !el.getAttribute) return false;
+        var tag = (el.tagName || "").toLowerCase();
+        if (tag !== "button" && tag !== "input") return false;
+
+        var id = (el.getAttribute("id") || "").toLowerCase();
+        var name = (el.getAttribute("name") || "").toLowerCase();
+        var cls = (el.getAttribute("class") || "").toLowerCase();
+        var aria = (el.getAttribute("aria-label") || "").toLowerCase();
+        var hay = id + " " + name + " " + cls + " " + aria;
+
+        if (hay.indexOf("add-to-cart") !== -1) return true;
+        if (hay.indexOf("add_to_cart") !== -1) return true;
+        if (hay.indexOf("add to cart") !== -1) return true;
+        if (hay.indexOf("addtocart") !== -1) return true;
+        if (name === "add") return true;
+
+        return false;
+      });
+
+      if (!btn) return;
+
+      var form = findClosest(btn, function (el) {
+        return el && el.tagName && el.tagName.toLowerCase() === "form";
+      });
+
+      if (form && isAddToCartForm(form)) {
+        fireAddToCart(extractProductFromAddForm(form));
+        return;
+      }
+
+      if (isProductPage()) {
+        fireAddToCart(getProductContextFromLiquid());
+      }
+    } catch (err) {}
+  }, true);
+
+  // Backstop: stamp ids when user clicks checkout buttons/links
+  document.addEventListener("click", function (e) {
+    try {
+      var el = e.target;
+      while (el && el !== document.documentElement) {
+        if (el.matches) {
+          if (el.matches('a[href*="/checkout"]') ||
+              el.matches('button[name="checkout"]') ||
+              el.matches('input[name="checkout"]')) {
+            stampCartAttributes();
+            return;
+          }
+        }
+        el = el.parentNode;
+      }
+    } catch (err) {}
+  }, true);
+
+})();
+</script>

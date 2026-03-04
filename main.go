@@ -13,9 +13,12 @@ func main() {
 	e := echo.New()
 
 	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
-		AllowOrigins: []string{"*"},
-		AllowMethods: []string{http.MethodPost, http.MethodOptions},
-		AllowHeaders: []string{"Content-Type"},
+		UnsafeAllowOriginFunc: func(c *echo.Context, origin string) (string, bool, error) {
+			return origin, true, nil
+		},
+		AllowMethods:     []string{http.MethodPost, http.MethodOptions},
+		AllowHeaders:     []string{"Content-Type"},
+		AllowCredentials: true,
 	}))
 
 	e.POST("/api/pixel/events", func(c *echo.Context) error {
