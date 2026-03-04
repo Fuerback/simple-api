@@ -22,10 +22,12 @@ func main() {
 		return c.NoContent(http.StatusOK)
 	})
 
-	addr := ":8080"
-	if port := os.Getenv("PORT"); port != "" {
-		addr = "0.0.0.0:" + port
+	// Render requires binding to 0.0.0.0; PORT defaults to 10000 on Render (see https://render.com/docs/web-services#port-binding)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
+	addr := "0.0.0.0:" + port
 	if err := e.Start(addr); err != nil {
 		log.Fatal(err)
 	}
