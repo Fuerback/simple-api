@@ -24,7 +24,7 @@ func main() {
 
 	addr := ":8080"
 	if port := os.Getenv("PORT"); port != "" {
-		addr = ":" + port
+		addr = "0.0.0.0:" + port
 	}
 	if err := e.Start(addr); err != nil {
 		log.Fatal(err)
